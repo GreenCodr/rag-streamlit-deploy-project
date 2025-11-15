@@ -315,38 +315,35 @@ def call_hf_llm(prompt, model, token, max_tokens=512, timeout=30):
         txt = json.dumps(data)
     return txt
 
+
 def make_llm_prompt_for_agg(question, short_context):
     """
     Produce a short instruction for the LLM: we already computed exact numbers locally,
-    so LLM should *explain* the results and produce a small JSON with keys:
+    so LLM should explain the results and produce a small JSON with keys:
       - answer_text
       - chart_type (bar|line|pie|sunburst|none)
-      - chart_spec: {"table":..., "x":..., "y":..., "agg": "count|sum|avg", "top_k":10}
-      - followups: list of suggested follow-up questions (1-3)
+      - chart_spec: an object with fields: table, x, y, agg, top_k
+      - followups: list of suggested follow-ups
     """
     prompt = f"""
 You are a helpful assistant helping interpret analytical results.
-Use ONLY the context below — do not guess values outside the context.
+Use ONLY the context below — do not invent values outside the context.
+
 Context:
 {json.dumps(short_context, indent=2)}
 
 The user asked: "{question}"
 
-Return a JSON dictionary with:
-- "answer": one short paragraph summarizing the insight
-- "chart_type": one of ["bar","line","pie","scatter","none"]
-- "chart_spec": {
-      "x": <column_name>,
-      "y": <column_name>,
-      "agg": <aggregation like 'count' or 'sum'>,
-      "top_k": <how many items to chart>
-  }
-- "followups": list of 2–4 follow-up questions.
+Return ONLY valid JSON with the following keys:
+- "answer_text": one short paragraph summarizing the insight.
+- "chart_type": one of ["bar","line","pie","sunburst","none"].
+- "chart_spec": {{ "table": "order_products__prior", "x": "product_id", "y": "count", "agg": "count", "top_k": 10 }}
+    (Note: this is an example. Use quoted column names; do NOT use angle brackets.)
+- "followups": list of 0..3 brief suggested follow-up questions.
 
-Important: **Return ONLY valid JSON.**
+Important: return ONLY the JSON object (no extra commentary).
 """
     return prompt
-
 def compute_chart_df_from_spec(spec, dfs):
     """
     Given chart_spec and our loaded dfs dict, compute an exact DataFrame to plot.
