@@ -328,7 +328,7 @@ def make_llm_prompt_for_agg(question, short_context):
 You are a helpful assistant helping interpret analytical results.
 Use ONLY the context below — do not guess values outside the context.
 Context:
-{json.dumps(context, indent=2)}
+{json.dumps(short_context, indent=2)}
 
 The user asked: "{question}"
 
