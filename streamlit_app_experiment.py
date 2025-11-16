@@ -222,7 +222,42 @@ def hf_chat_wrapper(hf_token: str, model_id: str, user_question: str, short_cont
         return {"answer_text": f"LLM call failed: {repr(e)}", "chart_type":"none","chart_spec":{},"followups":[],"confidence":0.0}
 
 # ---------------- Streamlit UI ----------------
-st.title("RAG-DB — Instacart (experiment, no backend)")
+st.set_page_config(page_title="RAG Relational Intelligence System", layout="wide")
+
+# --- Top Header Section ---
+st.markdown(
+    """
+    <style>
+    .big-title {
+        font-size: 36px;
+        font-weight: 700;
+        color: #2E8BC0;
+        text-align: center;
+        margin-bottom: -10px;
+    }
+    .sub-title {
+        font-size: 18px;
+        text-align: center;
+        color: #444;
+        margin-bottom: 25px;
+    }
+    .section-card {
+        padding: 15px;
+        background: #f9f9f9;
+        border-radius: 12px;
+        border: 1px solid #e0e0e0;
+        margin-top: 15px;
+        margin-bottom: 20px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown('<div class="big-title">RAG Relational Intelligence System</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">AI-powered SQL-like Insights • LLM-Enhanced Summaries • Smart Visual Exploration</div>', unsafe_allow_html=True)
+
+# --- Sidebar ---
 st.sidebar.header("Options / Settings")
 sample_nrows_prior = st.sidebar.number_input("Rows to load from order_products__prior (0 = full)", min_value=0, value=50000, step=10000)
 mode = st.sidebar.selectbox("Mode", ["local-only","with-llm"])
@@ -230,10 +265,11 @@ hf_token_input = st.sidebar.text_input("Hugging Face API key (optional)", value=
 hf_model_input = st.sidebar.text_input("HF model id (chat-capable)", value="meta-llama/Meta-Llama-3-8B-Instruct")
 st.sidebar.markdown("---")
 st.sidebar.write("Notes:")
-st.sidebar.write("- Local-only = deterministic exact answers + charts.")
-st.sidebar.write("- with-llm = ask HF to produce a short friendly JSON summary and (optional) chart_spec; app computes chart exactly.")
-st.sidebar.write("- If HF fails the app shows deterministic fallback.")
+st.sidebar.write("- Local-only = exact answers with deterministic charts.")
+st.sidebar.write("- With-LLM = friendly summary + suggested charts.")
+st.sidebar.write("- If LLM fails → fallback mode ensures accuracy.")
 
+# --- Query box ---
 q = st.text_area("Ask a question", value="Which products appear most frequently in prior orders?", height=140)
 run = st.button("Run")
 
