@@ -1,33 +1,29 @@
-# streamlit_app.py
+# streamlit_app_experiment.py
 """
-RAG-DB — Instacart explorer (self-contained + optional HF LLM)
-Usage (local):
-    streamlit run streamlit_app.py --server.port 8501
-
-Put CSVs under: data/data/instacart/{products,aisles,departments,orders,order_products__prior}.csv
-If you want LLM suggestions, provide HF_API_KEY in .env or paste in sidebar.
+Self-contained Streamlit app (NO FastAPI) for RAG-DB (Instacart).
+- Put CSVs in data/data/instacart/
+- Optional: provide HF_API_KEY in .env or paste in the sidebar for LLM summaries.
 """
 import os, json, re, time
 from pathlib import Path
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, List
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 from dotenv import load_dotenv
 
-# Optional HF client import - handled safely
+# Optional HF client
 try:
     from huggingface_hub import InferenceClient
-    HF_HUB_AVAILABLE = True
+    HF_AVAILABLE = True
 except Exception:
-    HF_HUB_AVAILABLE = False
+    HF_AVAILABLE = False
 
-# load .env (if exists)
 load_dotenv()
 
-# --- Config / paths ---
-st.set_page_config(page_title="RAG-DB — Instacart explorer", layout="wide")
+# --- Config ---
+st.set_page_config(page_title="RAG-DB — Instacart (experiment)", layout="wide")
 BASE = Path(".").resolve()
 DATA_DIR = BASE / "data" / "data" / "instacart"
 
@@ -41,7 +37,7 @@ def load_csv_if_exists(name: str, nrows: Optional[int] = None) -> Optional[pd.Da
 def detect_intent(q: str) -> str:
     ql = q.lower()
     agg_keywords = ["count","top","most","frequent","total","sum","avg","average","mean","least","how many","per product","reorder","ratio","percentage","orders by","which days","day of week"]
-    retrieval_keywords = ["show","list","example","what are","what is","which aisles","give me","find","show me"]
+    retrieval_keywords = ["show","list","example","what are","what is","which aisles","give me","find","show me","list items","list products","contain","contains"]
     if any(k in ql for k in agg_keywords):
         return "aggregation"
     if any(k in ql for k in retrieval_keywords):
@@ -49,10 +45,11 @@ def detect_intent(q: str) -> str:
     return "retrieval"
 
 def tokenize(s: str):
-    return [t for t in re.split(r"[^0-9a-z]+", s.lower()) if t]
+    return [t for t in re.split(r"[^0-9a-z]+", str(s).lower()) if t]
 
-def fuzzy_search_products(products: pd.DataFrame, q: str, top_k: int = 30):
-    if products is None: return []
+def fuzzy_search_products(products: pd.DataFrame, q: str, top_k: int = 50):
+    if products is None or q.strip()=="":
+        return []
     qtokens = tokenize(q)
     out=[]
     for _,r in products.iterrows():
@@ -64,7 +61,6 @@ def fuzzy_search_products(products: pd.DataFrame, q: str, top_k: int = 30):
             score = overlap/len(ntoks)
             out.append({"product_id": r["product_id"], "product_name": name, "score": score})
     out = sorted(out, key=lambda x:-x["score"])
-    # dedupe
     seen=set(); res=[]
     for it in out:
         if it["product_id"] in seen: continue
@@ -113,14 +109,12 @@ def orders_by_day_of_week(orders: pd.DataFrame):
     df["x"] = df["day"].astype("str"); df["y"] = df["count"]
     return df[["x","y"]]
 
-# compute generic chart from a LLM-suggested "chart_spec"
-def compute_chart_from_spec(chart_spec: dict, tables: dict):
+def compute_chart_from_spec(chart_spec: Dict[str,Any], tables: Dict[str,pd.DataFrame]):
     try:
         table_name = chart_spec.get("table")
         if table_name not in tables or tables[table_name] is None:
             return None
         df = tables[table_name].copy()
-        # optional join
         js = chart_spec.get("join")
         if js:
             right_table = js.get("table")
@@ -133,7 +127,7 @@ def compute_chart_from_spec(chart_spec: dict, tables: dict):
         xcol = chart_spec.get("x")
         ycol = chart_spec.get("y")
         agg = chart_spec.get("agg","count")
-        top_k = int(chart_spec.get("top_k",10))
+        top_k = int(chart_spec.get("top_k", 10))
         if agg == "count":
             grouped = df.groupby(xcol).size().rename("y").reset_index().sort_values("y",ascending=False).head(top_k)
         elif agg == "sum":
@@ -164,58 +158,81 @@ def render_chart(df: pd.DataFrame, chart_type: str="bar", title: str=""):
         fig = px.bar(df, x="x", y="y", title=title)
     st.plotly_chart(fig, use_container_width=True)
 
-# ---------------- LLM helpers (Hugging Face) ----------------
-def call_hf_chat_completion(hf_token: str, model_id: str, user_question: str, short_context: Any=None, max_tokens: int=400):
-    """
-    Calls InferenceClient.chat_completion to return a JSON suggestion.
-    Returns a Python dict. If LLM reply cannot be parsed as JSON, returns fallback dict with raw_text
-    """
-    if not HF_HUB_AVAILABLE:
-        raise RuntimeError("huggingface_hub not installed")
-    client = InferenceClient(token=hf_token)
-    system = (
-        "You are a helpful assistant. Use ONLY the provided short context (exact numbers/summaries) "
-        "and do not hallucinate additional numeric facts. Return a SINGLE JSON object ONLY."
-    )
-    short_ctx_txt = json.dumps(short_context, ensure_ascii=False, indent=2) if short_context else "{}"
-    user_msg = (
-        f"Context (short):\n{short_ctx_txt}\n\nUser question:\n{user_question}\n\n"
-        "Return JSON with keys:\n"
-        "- answer_text: short 1-2 sentences\n"
-        "- chart_type: one of [\"bar\",\"line\",\"pie\",\"treemap\",\"none\"]\n"
-        "- chart_spec: object {table, x, y, agg: 'count'|'sum'|'avg', join: optional, top_k: optional}\n"
-        "- followups: optional list of short follow-up Qs\n"
-    )
-    messages = [{"role":"system","content":system},{"role":"user","content":user_msg}]
-    resp = client.chat_completion(messages=messages, max_tokens=max_tokens, temperature=0.0)
-    # extract text
+# ------------------ LLM wrapper (conservative, JSON) ------------------
+def _extract_json_from_text(text: str):
+    if not isinstance(text, str):
+        return None
+    # try direct json
     try:
-        content = resp.choices[0].message.content
+        return json.loads(text)
     except Exception:
-        content = str(resp)
-    # try to extract json block
-    m = re.search(r"\{[\s\S]*\}", content)
-    if m:
-        jtxt = m.group(0)
+        pass
+    # find braces blocks
+    matches = re.findall(r"\{(?:[^{}]|(?R))*\}", text, flags=re.DOTALL)
+    if matches:
+        matches = sorted(matches, key=lambda s:-len(s))
+        for m in matches:
+            try:
+                return json.loads(m)
+            except Exception:
+                continue
+    try:
+        alt = text.strip().replace("'", "\"")
+        return json.loads(alt)
+    except Exception:
+        return None
+
+def hf_chat_wrapper(hf_token: str, model_id: str, user_question: str, short_context: Any=None, max_tokens:int=400):
+    SAFE = {"answer_text":"(LLM unavailable)","chart_type":"none","chart_spec":{},"followups":[],"confidence":0.0}
+    if not hf_token or not HF_AVAILABLE:
+        return {**SAFE, "answer_text": "LLM disabled (HF token missing or huggingface_hub not available)."}
+    # Build careful prompt: ask for JSON only, be conservative, include retrieved examples
+    ctxtxt = ""
+    if short_context:
         try:
-            jobj = json.loads(jtxt)
-            return jobj
+            ctxtxt = json.dumps(short_context, ensure_ascii=False, indent=2)
         except Exception:
-            # parsing error -> return raw fallback
-            return {"answer_text": content.strip()[:1000], "chart_type":"none", "chart_spec":{}, "followups":[]}
-    else:
-        return {"answer_text": content.strip()[:1000], "chart_type":"none", "chart_spec":{}, "followups":[]}
+            ctxtxt = str(short_context)
+    system = (
+        "You are a cautious data assistant. USE ONLY the numeric and textual values provided in the short context "
+        "and the list of retrieved examples. Do NOT make up numbers. If unsure, say 'I may be mistaken' and keep confidence low. "
+        "Return ONLY a JSON object (no explanation) with keys: answer_text (string, 1-3 sentences), confidence (0.0-1.0), chart_type (bar|line|pie|treemap|none), chart_spec (object with table,x,y,agg,optional join,optional top_k), followups (list)."
+    )
+    user = f"Short context:\n{ctxtxt}\n\nUser question:\n{user_question}\n\nReturn JSON only. If describing a chart_spec, use table names: prior, products, orders, aisles, departments. Be conservative."
+    messages = [{"role":"system","content":system},{"role":"user","content":user}]
+    try:
+        client = InferenceClient(model=model_id, token=hf_token)
+        resp = client.chat_completion(messages=messages, max_tokens=max_tokens, temperature=0.0)
+        try:
+            content = resp.choices[0].message.content
+        except Exception:
+            content = str(resp)
+        parsed = _extract_json_from_text(content)
+        if not parsed:
+            # fallback: return raw text as answer_text but low confidence
+            return {"answer_text": content.strip()[:1000], "chart_type":"none","chart_spec":{},"followups":[],"confidence":0.3}
+        # normalize
+        ans = parsed.get("answer_text") or parsed.get("answer") or parsed.get("text") or ""
+        chart_type = parsed.get("chart_type","none")
+        chart_spec = parsed.get("chart_spec", {}) or {}
+        followups = parsed.get("followups", []) or []
+        confidence = float(parsed.get("confidence", 0.9 if ans else 0.5))
+        return {"answer_text": str(ans).strip(), "chart_type": chart_type if chart_type in {"bar","line","pie","treemap","none"} else "none", "chart_spec": chart_spec if isinstance(chart_spec, dict) else {}, "followups": followups if isinstance(followups,list) else [], "confidence": max(0.0, min(1.0, float(confidence)))}
+    except Exception as e:
+        return {"answer_text": f"LLM call failed: {repr(e)}", "chart_type":"none","chart_spec":{},"followups":[],"confidence":0.0}
 
 # ---------------- Streamlit UI ----------------
-st.title("RAG-DB — Instacart explorer (local + optional LLM)")
+st.title("RAG-DB — Instacart (experiment, no backend)")
 st.sidebar.header("Options / Settings")
-
 sample_nrows_prior = st.sidebar.number_input("Rows to load from order_products__prior (0 = full)", min_value=0, value=50000, step=10000)
 mode = st.sidebar.selectbox("Mode", ["local-only","with-llm"])
 hf_token_input = st.sidebar.text_input("Hugging Face API key (optional)", value=os.getenv("HF_API_KEY",""), type="password")
 hf_model_input = st.sidebar.text_input("HF model id (chat-capable)", value="meta-llama/Meta-Llama-3-8B-Instruct")
 st.sidebar.markdown("---")
-st.sidebar.write("Notes: local-only always runs exact queries. with-llm asks HF to suggest friendly text & chart_spec; chart computed locally.")
+st.sidebar.write("Notes:")
+st.sidebar.write("- Local-only = deterministic exact answers + charts.")
+st.sidebar.write("- with-llm = ask HF to produce a short friendly JSON summary and (optional) chart_spec; app computes chart exactly.")
+st.sidebar.write("- If HF fails the app shows deterministic fallback.")
 
 q = st.text_area("Ask a question", value="Which products appear most frequently in prior orders?", height=140)
 run = st.button("Run")
@@ -232,16 +249,18 @@ def load_tables(nrows_prior: Optional[int]=None):
 if run:
     st.info("Loading CSVs...")
     nrows = None if sample_nrows_prior==0 else int(sample_nrows_prior)
-    tbls = load_tables(nrows_prior=nrows)
-    products = tbls["products"]; aisles = tbls["aisles"]; departments = tbls["departments"]; orders = tbls["orders"]; prior = tbls["prior"]
+    tables = load_tables(nrows_prior=nrows)
+    products = tables["products"]; aisles = tables["aisles"]; departments = tables["departments"]; orders = tables["orders"]; prior = tables["prior"]
     if prior is None or products is None:
-        st.error("Missing CSVs: ensure products.csv and order_products__prior.csv are in data/data/instacart/")
+        st.error("Missing CSVs. Ensure CSVs are in data/data/instacart/")
         st.stop()
 
-    intent = detect_intent(q)
-    st.markdown(f"### Detected intent: **{intent}**")
+    ql_raw = str(q).strip()
+    st.markdown("### Intent detection & execution")
+    intent = detect_intent(ql_raw)
+    st.write(f"Detected intent: **{intent}**")
 
-    # prepare short context (small exact summary)
+    # short context for LLM
     short_context = {}
     try:
         short_context["rows_in_prior"] = int(len(prior))
@@ -249,95 +268,102 @@ if run:
     except Exception as e:
         short_context["error"] = str(e)
 
-    use_llm = (mode=="with-llm") and hf_token_input.strip()!="" and HF_HUB_AVAILABLE
+    use_llm = (mode=="with-llm") and hf_token_input.strip()!="" and HF_AVAILABLE
     tables_map = {"prior":prior,"products":products,"orders":orders,"aisles":aisles,"departments":departments}
 
-    # --- Aggregation handlers ---
+    # ---------------- AGGREGATION ----------------
     if intent=="aggregation":
-        ql = q.lower()
-        # top products
-        if any(x in ql for x in ["most frequently","most frequent","most frequently ordered","top products","most ordered","appear most frequently","most frequent product"]):
+        ql = ql_raw.lower()
+        if any(x in ql for x in ["most frequently","most frequent","top products","most ordered","appear most frequently"]):
             df = top_products_prior(prior, products, top_k=15)
             st.subheader("Top products (exact counts)")
             st.dataframe(df.rename(columns={"x":"product_name","y":"count"}).head(15))
             render_chart(df, chart_type="bar", title="Top products (count)")
-            # extra visualizations
-            with st.expander("More views"):
+            with st.expander("More visualizations"):
                 render_chart(df, chart_type="treemap", title="Top products (treemap)")
                 render_chart(df, chart_type="pie", title="Top products (pie)")
         elif any(x in ql for x in ["least frequently","least ordered"]):
             df = least_products_prior(prior, products, top_k=15)
-            st.subheader("Least frequently ordered products (sample)")
+            st.subheader("Least frequently ordered (sample)")
             st.dataframe(df.rename(columns={"x":"product_name","y":"count"}))
             render_chart(df, chart_type="bar", title="Least frequently ordered")
         elif "average number of orders per product" in ql or "average orders per product" in ql or "avg orders per product" in ql:
             avg = avg_orders_per_product(prior)
-            st.write(f"**Average occurrences per product** (mean of counts): {avg:.2f}")
-        elif "reorder ratio" in ql or "average reorder" in ql or "reorder rate" in ql:
+            st.write(f"**Average occurrences per product**: {avg:.2f}")
+        elif "reorder ratio" in ql or "average reorder" in ql:
             r = avg_reorder_ratio(prior)
             if r is not None:
                 st.write(f"Average reorder ratio across products: **{r:.3f}**")
             else:
-                st.info("No 'reordered' column present in this dataset sample.")
+                st.info("No 'reordered' column present.")
         elif "day" in ql or "day of week" in ql or "which days" in ql:
             df = orders_by_day_of_week(orders)
             if df is not None:
-                st.subheader("Orders by day of week")
+                st.subheader("Orders by day of week (0=Sunday..6=Saturday)")
                 st.dataframe(df.rename(columns={"x":"day","y":"count"}))
-                render_chart(df, chart_type="bar", title="Orders by day (0=Sunday..6=Saturday)")
+                render_chart(df, chart_type="bar", title="Orders by day")
         else:
-            # no exact handler → try LLM suggestion or fallback to top products
+            # fallback: compute top products locally + optionally ask LLM for polished summary
             local_df = top_products_prior(prior, products, top_k=10)
             local_answer = f"Top product: {local_df.iloc[0]['x']} with {int(local_df.iloc[0]['y'])} occurrences."
             if use_llm:
-                with st.spinner("Asking LLM for a friendly summary and chart suggestion..."):
-                    try:
-                        jobj = call_hf_chat_completion(hf_token_input.strip(), hf_model_input.strip(), q, short_context)
-                        st.subheader("LLM suggested answer and chart_spec (parsed)")
-                        st.json(jobj)
+                with st.spinner("Asking LLM for a helpful summary and chart suggestion..."):
+                    jobj = hf_chat_wrapper(hf_token_input.strip(), hf_model_input.strip(), ql_raw, {**short_context, "retrieved_examples": [r["product_name"] for r in local_df.head(10).to_dict(orient='records')]})
+                    st.subheader("LLM suggested (parsed)")
+                    st.json(jobj)
+                    llm_text = jobj.get("answer_text","")
+                    # Defensive override: if LLM says "no" but we have results -> correct it
+                    if isinstance(llm_text, str) and any(p in llm_text.lower() for p in ["no items","no matches","none found"]) and len(local_df)>0:
+                        st.warning("LLM claimed no results but deterministic computation found matches — showing accurate results below.")
+                        st.write(local_answer)
+                        render_chart(local_df, chart_type="bar", title="Local top products (exact)")
+                        st.dataframe(local_df.rename(columns={"x":"product_name","y":"count"}))
+                    else:
                         st.write("LLM answer:")
-                        st.write(jobj.get("answer_text","(no answer_text)"))
-                        # compute chart_spec if present
-                        cs = jobj.get("chart_spec",{})
-                        ct = jobj.get("chart_type","bar")
+                        st.write(llm_text)
+                        # compute LLM chart if present
+                        cs = jobj.get("chart_spec", {})
+                        ct = jobj.get("chart_type", "bar")
                         if cs:
                             chart_df = compute_chart_from_spec(cs, tables_map)
                             if chart_df is not None:
                                 render_chart(chart_df, chart_type=ct, title="LLM suggested chart (computed exactly)")
                             else:
-                                st.warning("Could not compute chart_spec locally — check chart_spec fields (table/x/y).")
-                        if jobj.get("followups"):
-                            st.markdown("**Follow-up suggestions:**")
-                            for f in jobj["followups"][:5]:
-                                st.write("-", f)
-                    except Exception as e:
-                        st.error(f"LLM step failed: {e}")
-                        st.info("Showing local fallback result:")
-                        st.write(local_answer)
-                        render_chart(local_df, chart_type="bar", title="Local fallback: top products")
+                                st.warning("LLM suggested chart_spec couldn't be computed locally.")
+                        # fallback show local
+                        if not cs:
+                            st.write(local_answer)
+                            render_chart(local_df, chart_type="bar", title="Local top products (exact)")
             else:
-                st.info("No handler matched and LLM disabled. Showing local fallback (top products).")
+                st.info("LLM disabled. Showing deterministic fallback.")
                 st.write(local_answer)
-                render_chart(local_df, chart_type="bar", title="Local fallback: top products")
+                render_chart(local_df, chart_type="bar", title="Local top products (exact)")
 
-    # --- Retrieval handlers ---
+    # ---------------- RETRIEVAL ----------------
     else:
-        st.subheader("Retrieval / Keyword search")
-        proc = q.strip()
-        prod_hits = fuzzy_search_products(products, proc, top_k=30)
+        st.subheader("Retrieval / keyword search")
+        proc = ql_raw
+        prod_hits = fuzzy_search_products(products, proc, top_k=50)
         if prod_hits:
             st.write(f"Products matching query (top {len(prod_hits)}):")
-            df = pd.DataFrame(prod_hits)[["product_id","product_name"]]
+            df = pd.DataFrame(prod_hits)[["product_id","product_name","score"]]
             st.dataframe(df)
-            # optional LLM summary
+            # LLM summary of retrieved list (optional)
             if use_llm:
-                with st.spinner("Asking LLM to summarize results..."):
-                    try:
-                        jobj = call_hf_chat_completion(hf_token_input.strip(), hf_model_input.strip(), q, short_context, max_tokens=200)
-                        st.subheader("LLM summary (optional)")
-                        st.write(jobj.get("answer_text","(no LLM answer)"))
-                    except Exception:
-                        st.info("LLM summary failed; continuing.")
+                # include top retrieved example names in LLM context
+                retrieved_names = [r["product_name"] for r in prod_hits[:20]]
+                sc_for_llm = {**short_context, "retrieved_examples": retrieved_names}
+                jobj = hf_chat_wrapper(hf_token_input.strip(), hf_model_input.strip(), ql_raw, sc_for_llm)
+                st.subheader("LLM summary (optional)")
+                llm_text = jobj.get("answer_text","")
+                # defensive: if LLM says "no results" but prod_hits exists -> override
+                if isinstance(llm_text, str) and any(p in llm_text.lower() for p in ["no items","no matches","none found"]) and len(prod_hits)>0:
+                    st.warning("LLM summary contradicted retrieved items — showing deterministic summary:")
+                    top_names = retrieved_names[:8]
+                    st.write(f"Found {len(prod_hits)} matching product(s). Top examples: {', '.join(top_names)}")
+                    st.dataframe(pd.DataFrame([{"product_name":n} for n in top_names]))
+                else:
+                    st.write(llm_text)
         else:
             st.info("No product fuzzy match found. Trying aisles substring match.")
             if aisles is not None:
